@@ -13,8 +13,8 @@ tests match that validated behavior:
   * get_channels reads ``coordinator._channel_info`` directly
   * trace enforces ``added_to_node``, uses a pre-registered
     PATH_RESPONSE listener + ``commands.send(b"\\x34\\x00"+pubkey)`` for
-    flood contacts, and issues ``send_trace(0, tag, 0, bytes)`` with a
-    round-trip 1-byte-hash path.
+    flood contacts (unless ``route`` supplies an explicit path hex), and
+    issues ``send_trace(0, tag, 0, bytes)`` with a round-trip 1-byte-hash path.
 """
 import asyncio
 import importlib.util
@@ -487,6 +487,71 @@ async def test_trace_flood_contact_runs_path_discovery_then_traces(monkeypatch):
     # send_trace used the discovered path, truncated to 1-byte hashes.
     sent_call = coord.api.mesh_core.commands.send_trace.call_args
     assert sent_call.args == (0, 99, 0, bytes.fromhex("aabbabbbaa"))
+
+
+@pytest.mark.asyncio
+async def test_trace_explicit_route_skips_path_discovery_on_flood_contact(monkeypatch):
+    """Optional route hex: use bytes as-is; skip PATH_REQ even when out_path_len is -1."""
+    monkeypatch.setattr(_module, "random", MagicMock(randint=lambda lo, hi: 77))
+
+    pubkey = "abcdef" + "34" * 29
+    contacts = {
+        pubkey: {
+            "adv_name": "flood",
+            "public_key": pubkey,
+            "out_path_len": -1,
+            "out_path": "",
+            "added_to_node": True,
+            "pubkey_prefix": pubkey[:12],
+        }
+    }
+    send_event = _Event(_ET.MSG_SENT, {"tag": 77, "suggested_timeout": 2000})
+    trace_event = _Event(
+        _ET.TRACE_DATA,
+        {"tag": 77, "path_len": 0, "path": [{"snr": -1.0}]},
+    )
+    coord = _build_coordinator(
+        contacts_dict=contacts,
+        trace_send_event=send_event,
+        trace_event=trace_event,
+    )
+    _, regs = await _setup_and_get_handlers(coord)
+    handler, _ = regs["trace"]
+
+    explicit = "deadbeef"
+    response = await handler(
+        _call({ATTR_PUBKEY_PREFIX: "abcdef", "route": explicit})
+    )
+    assert response["trace"] is not None
+    coord.api.mesh_core.commands.send.assert_not_called()
+    sent_call = coord.api.mesh_core.commands.send_trace.call_args
+    assert sent_call.args == (0, 77, 0, bytes.fromhex(explicit))
+
+
+@pytest.mark.asyncio
+async def test_trace_invalid_route_hex_returns_structured_error(monkeypatch):
+    monkeypatch.setattr(_module, "random", MagicMock(randint=lambda lo, hi: 1))
+
+    pubkey = "abcdef" + "12" * 29
+    contacts = {
+        pubkey: {
+            "adv_name": "target",
+            "public_key": pubkey,
+            "out_path_len": 0,
+            "out_path": "",
+            "added_to_node": True,
+            "pubkey_prefix": pubkey[:12],
+        }
+    }
+    coord = _build_coordinator(contacts_dict=contacts)
+    _, regs = await _setup_and_get_handlers(coord)
+    handler, _ = regs["trace"]
+
+    response = await handler(
+        _call({ATTR_PUBKEY_PREFIX: "abcdef", "route": "not-hex"})
+    )
+    assert response == {"trace": None, "error": "invalid_route"}
+    coord.api.mesh_core.commands.send_trace.assert_not_called()
 
 
 @pytest.mark.asyncio

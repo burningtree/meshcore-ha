@@ -228,8 +228,9 @@ trace:
     Trace the route to a contact and return hop count, per-hop path, and
     round-trip time. The contact must be saved to the device — discovered-only
     contacts return {"trace": null, "error": "contact_not_on_device"}. For
-    flood contacts a path-discovery pass runs first; the result is used to
-    build the trace. On timeout or any failure, returns {"trace": null,
+    flood contacts a path-discovery pass runs first unless you pass an
+    explicit route hex string; the firmware path is then used to build the
+    trace. On timeout or any failure, returns {"trace": null,
     "error": "..."} so automations always get a structured response.
   response: optional
   fields:
@@ -238,6 +239,18 @@ trace:
       description: The public key prefix (at least 6 characters) of the contact to trace.
       required: true
       example: "f293ac"
+      selector:
+        text:
+    route:
+      name: Trace route (hex)
+      description: >-
+        Optional. Hex bytes for the trace path passed to the radio (same layout
+        the integration builds from out_path + target + return leg). Whitespace
+        is ignored. When set, path discovery is skipped even for flood-routed
+        contacts — use with a path you already know (e.g. from a sensor or a
+        prior trace).
+      required: false
+      example: "aabbabbbaa"
       selector:
         text:
     timeout:

@@ -1328,12 +1328,22 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             handler (Mesh.cpp:41-66) for the sender to receive the echo,
             and 1-byte hashes are empirically the only width that
             completes reliably in production meshes.
+          * Optional ``route`` (hex string, whitespace ignored): use these
+            bytes as the trace path instead of the contact's stored path
+            or a path-discovery pass — same format as ``send_trace`` expects
+            (e.g. from a prior trace or ``out_path`` reconstruction).
           * Every failure mode returns a structured ``{"trace": null,
             "error": "..."}`` dict so automations never see an exception.
         """
         entry_id = call.data.get(ATTR_ENTRY_ID)
         pubkey_prefix = call.data[ATTR_PUBKEY_PREFIX]
         requested_timeout_s = float(call.data.get("timeout", 15))
+        route_raw = call.data.get("route")
+        route_hex = (
+            "".join(str(route_raw).split())
+            if route_raw not in (None, "", False)
+            else ""
+        )
 
         coordinator = _resolve_coordinator(entry_id)
         if coordinator is None:
@@ -1369,143 +1379,154 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         mesh_core = api.mesh_core
         tag = random.randint(0, 0xFFFFFFFF)
+        flags = 0
 
-        out_path_len = contact.get("out_path_len", -1)
-        out_path_hash_mode = contact.get("out_path_hash_mode", 0)
-        out_path_hex = contact.get("out_path", "") or ""
-
-        # ── Flood contact: run path discovery first ──
-        if out_path_len == -1:
+        if route_hex:
             try:
-                dst_bytes = bytes.fromhex(public_key)
-            except (ValueError, TypeError) as ex:
-                _LOGGER.error("trace: bad pubkey hex for path discovery: %s", ex)
+                trace_path_bytes = bytes.fromhex(route_hex)
+            except ValueError as ex:
+                _LOGGER.error("trace: invalid route hex: %s", ex)
+                return {"trace": None, "error": "invalid_route"}
+            _LOGGER.debug(
+                "trace: sending tag=%08x flags=%d explicit_route=%s (len=%d bytes)",
+                tag, flags, route_hex, len(trace_path_bytes),
+            )
+        else:
+            out_path_len = contact.get("out_path_len", -1)
+            out_path_hash_mode = contact.get("out_path_hash_mode", 0)
+            out_path_hex = contact.get("out_path", "") or ""
+
+            # ── Flood contact: run path discovery first ──
+            if out_path_len == -1:
+                try:
+                    dst_bytes = bytes.fromhex(public_key)
+                except (ValueError, TypeError) as ex:
+                    _LOGGER.error("trace: bad pubkey hex for path discovery: %s", ex)
+                    return {"trace": None, "error": "contact_missing_pubkey"}
+
+                # Pre-register the PATH_RESPONSE listener so the response can't
+                # arrive and be dispatched before our subscription is live.
+                # Filter by pubkey_pre so concurrent path-discovery traffic
+                # for other contacts can't satisfy this wait. Mirrors
+                # Remote-Terminal-for-MeshCore's approach.
+                path_response_task = asyncio.create_task(
+                    mesh_core.dispatcher.wait_for_event(
+                        EventType.PATH_RESPONSE,
+                        attribute_filters={"pubkey_pre": pubkey_prefix},
+                        timeout=30.0,  # outer safety; real bound applied below
+                    )
+                )
+
+                pd_data = b"\x34\x00" + dst_bytes
+                try:
+                    send_result = await mesh_core.commands.send(
+                        pd_data,
+                        [EventType.MSG_SENT, EventType.ERROR],
+                    )
+                except Exception as ex:
+                    path_response_task.cancel()
+                    _LOGGER.error("trace: path discovery send raised: %s", ex)
+                    return {"trace": None, "error": "path_discovery_failed"}
+
+                if send_result is None:
+                    path_response_task.cancel()
+                    return {
+                        "trace": None,
+                        "error": "path_discovery_failed",
+                        "reason": "no_firmware_ack",
+                    }
+
+                if getattr(send_result, "type", None) == EventType.ERROR:
+                    path_response_task.cancel()
+                    # Firmware PacketType.ERROR carries {"error_code",
+                    # "code_string"} when mapped, or {"reason"} for reader
+                    # parse-failures. Accept either shape.
+                    reason = "unknown"
+                    if isinstance(send_result.payload, dict):
+                        p = send_result.payload
+                        reason = (
+                            p.get("code_string")
+                            or p.get("reason")
+                            or (f"error_code={p['error_code']}" if "error_code" in p else "unknown")
+                        )
+                    elif send_result.payload is not None:
+                        reason = repr(send_result.payload)
+                    return {
+                        "trace": None,
+                        "error": "path_discovery_rejected",
+                        "reason": reason,
+                    }
+
+                # MSG_SENT — firmware accepted and broadcast the request.
+                # Apply a 15s floor on the PATH_RESPONSE wait — two-hop flood
+                # round-trips routinely run 5-12s under real LoRa conditions,
+                # and a shorter timeout gives up before the mesh has had time
+                # to answer. Honour firmware's suggested_timeout if it ever
+                # exceeds 15s.
+                suggested_ms = 0
+                if isinstance(send_result.payload, dict):
+                    suggested_ms = send_result.payload.get("suggested_timeout", 0) or 0
+                pd_timeout = max(suggested_ms / 800.0, 15.0)
+
+                try:
+                    path_event = await asyncio.wait_for(
+                        path_response_task, timeout=pd_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    path_response_task.cancel()
+                    path_event = None
+                except Exception as ex:
+                    path_response_task.cancel()
+                    _LOGGER.error("trace: PATH_RESPONSE wait raised: %s", ex)
+                    return {"trace": None, "error": "path_discovery_failed"}
+
+                if path_event is None:
+                    return {"trace": None, "error": "path_discovery_timeout"}
+
+                discovered = path_event.payload or {}
+                out_path_len = discovered.get("out_path_len", -1)
+                if out_path_len < 0:
+                    return {
+                        "trace": None,
+                        "error": "path_discovery_failed",
+                        "reason": "malformed_path_response",
+                    }
+
+                out_path_hash_len = discovered.get("out_path_hash_len", 1)
+                out_path_hash_mode = {1: 0, 2: 1, 4: 2}.get(out_path_hash_len, 0)
+                out_path_hex = discovered.get("out_path", "") or ""
+
+            # ── Build the round-trip 1-byte-hash path ──
+            # Force flags=0 (1-byte hashes) regardless of the contact's cached
+            # hash mode: 2-byte traces empirically fail to complete round-trip
+            # in production meshes. Truncate each stored hop to its first byte
+            # to match.
+            target_hash_hex = public_key[:2]  # first 1 byte
+            if not target_hash_hex:
                 return {"trace": None, "error": "contact_missing_pubkey"}
 
-            # Pre-register the PATH_RESPONSE listener so the response can't
-            # arrive and be dispatched before our subscription is live.
-            # Filter by pubkey_pre so concurrent path-discovery traffic
-            # for other contacts can't satisfy this wait. Mirrors
-            # Remote-Terminal-for-MeshCore's approach.
-            path_response_task = asyncio.create_task(
-                mesh_core.dispatcher.wait_for_event(
-                    EventType.PATH_RESPONSE,
-                    attribute_filters={"pubkey_pre": pubkey_prefix},
-                    timeout=30.0,  # outer safety; real bound applied below
-                )
+            stored_hop_width = {0: 2, 1: 4, 2: 8}.get(out_path_hash_mode, 2)
+            outbound_hops = []
+            for i in range(out_path_len):
+                start = i * stored_hop_width
+                stored_hop = out_path_hex[start : start + stored_hop_width]
+                if len(stored_hop) >= 2:
+                    outbound_hops.append(stored_hop[:2])
+            return_hops = list(reversed(outbound_hops))
+            full_path_hex = (
+                "".join(outbound_hops) + target_hash_hex + "".join(return_hops)
             )
 
-            pd_data = b"\x34\x00" + dst_bytes
             try:
-                send_result = await mesh_core.commands.send(
-                    pd_data,
-                    [EventType.MSG_SENT, EventType.ERROR],
-                )
-            except Exception as ex:
-                path_response_task.cancel()
-                _LOGGER.error("trace: path discovery send raised: %s", ex)
-                return {"trace": None, "error": "path_discovery_failed"}
+                trace_path_bytes = bytes.fromhex(full_path_hex)
+            except ValueError as ex:
+                _LOGGER.error("trace: bad hex in path construction: %s", ex)
+                return {"trace": None, "error": "internal_error"}
 
-            if send_result is None:
-                path_response_task.cancel()
-                return {
-                    "trace": None,
-                    "error": "path_discovery_failed",
-                    "reason": "no_firmware_ack",
-                }
-
-            if getattr(send_result, "type", None) == EventType.ERROR:
-                path_response_task.cancel()
-                # Firmware PacketType.ERROR carries {"error_code",
-                # "code_string"} when mapped, or {"reason"} for reader
-                # parse-failures. Accept either shape.
-                reason = "unknown"
-                if isinstance(send_result.payload, dict):
-                    p = send_result.payload
-                    reason = (
-                        p.get("code_string")
-                        or p.get("reason")
-                        or (f"error_code={p['error_code']}" if "error_code" in p else "unknown")
-                    )
-                elif send_result.payload is not None:
-                    reason = repr(send_result.payload)
-                return {
-                    "trace": None,
-                    "error": "path_discovery_rejected",
-                    "reason": reason,
-                }
-
-            # MSG_SENT — firmware accepted and broadcast the request.
-            # Apply a 15s floor on the PATH_RESPONSE wait — two-hop flood
-            # round-trips routinely run 5-12s under real LoRa conditions,
-            # and a shorter timeout gives up before the mesh has had time
-            # to answer. Honour firmware's suggested_timeout if it ever
-            # exceeds 15s.
-            suggested_ms = 0
-            if isinstance(send_result.payload, dict):
-                suggested_ms = send_result.payload.get("suggested_timeout", 0) or 0
-            pd_timeout = max(suggested_ms / 800.0, 15.0)
-
-            try:
-                path_event = await asyncio.wait_for(
-                    path_response_task, timeout=pd_timeout,
-                )
-            except asyncio.TimeoutError:
-                path_response_task.cancel()
-                path_event = None
-            except Exception as ex:
-                path_response_task.cancel()
-                _LOGGER.error("trace: PATH_RESPONSE wait raised: %s", ex)
-                return {"trace": None, "error": "path_discovery_failed"}
-
-            if path_event is None:
-                return {"trace": None, "error": "path_discovery_timeout"}
-
-            discovered = path_event.payload or {}
-            out_path_len = discovered.get("out_path_len", -1)
-            if out_path_len < 0:
-                return {
-                    "trace": None,
-                    "error": "path_discovery_failed",
-                    "reason": "malformed_path_response",
-                }
-
-            out_path_hash_len = discovered.get("out_path_hash_len", 1)
-            out_path_hash_mode = {1: 0, 2: 1, 4: 2}.get(out_path_hash_len, 0)
-            out_path_hex = discovered.get("out_path", "") or ""
-
-        # ── Build the round-trip 1-byte-hash path ──
-        # Force flags=0 (1-byte hashes) regardless of the contact's cached
-        # hash mode: 2-byte traces empirically fail to complete round-trip
-        # in production meshes. Truncate each stored hop to its first byte
-        # to match.
-        flags = 0
-        target_hash_hex = public_key[:2]  # first 1 byte
-        if not target_hash_hex:
-            return {"trace": None, "error": "contact_missing_pubkey"}
-
-        stored_hop_width = {0: 2, 1: 4, 2: 8}.get(out_path_hash_mode, 2)
-        outbound_hops = []
-        for i in range(out_path_len):
-            start = i * stored_hop_width
-            stored_hop = out_path_hex[start : start + stored_hop_width]
-            if len(stored_hop) >= 2:
-                outbound_hops.append(stored_hop[:2])
-        return_hops = list(reversed(outbound_hops))
-        full_path_hex = (
-            "".join(outbound_hops) + target_hash_hex + "".join(return_hops)
-        )
-
-        try:
-            trace_path_bytes = bytes.fromhex(full_path_hex)
-        except ValueError as ex:
-            _LOGGER.error("trace: bad hex in path construction: %s", ex)
-            return {"trace": None, "error": "internal_error"}
-
-        _LOGGER.debug(
-            "trace: sending tag=%08x flags=%d path=%s (hops=%d, target=%s)",
-            tag, flags, full_path_hex, len(outbound_hops), target_hash_hex,
-        )
+            _LOGGER.debug(
+                "trace: sending tag=%08x flags=%d path=%s (hops=%d, target=%s)",
+                tag, flags, full_path_hex, len(outbound_hops), target_hash_hex,
+            )
 
         # ── Send trace and await TRACE_DATA with our tag ──
         start_time = time.monotonic()
@@ -1574,6 +1595,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         schema=vol.Schema({
             vol.Required(ATTR_PUBKEY_PREFIX): cv.string,
             vol.Optional(ATTR_ENTRY_ID): cv.string,
+            vol.Optional("route"): cv.string,
             vol.Optional("timeout", default=15): vol.All(
                 vol.Coerce(float), vol.Range(min=1, max=120)
             ),
