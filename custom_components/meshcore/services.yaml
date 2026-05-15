@@ -244,15 +244,41 @@ trace:
     route:
       name: Trace route (hex)
       description: >-
-        Optional. Hex bytes for the trace path passed to the radio (same layout
-        the integration builds from out_path + target + return leg). Whitespace
-        is ignored. When set, path discovery is skipped even for flood-routed
-        contacts — use with a path you already know (e.g. from a sensor or a
-        prior trace).
+        Optional. Either one contiguous hex string (full send_trace path), or
+        comma-separated hop hashes of equal width — e.g. 0a34,556e is two 2-byte
+        hops (whitespace ignored). Enable "Wrap outbound only" to pass only the
+        forward hop list; the integration then appends the contact pubkey
+        fragment and the return leg like automatic tracing. Response hops come
+        from the radio, not from how many segments you type; a one-byte path
+        cannot produce a multi-hop trace.
       required: false
-      example: "aabbabbbaa"
+      example: "0a34,556e"
       selector:
         text:
+    route_wrap:
+      name: Wrap outbound only
+      description: >-
+        When enabled, route lists only outbound hop hashes (comma-separated or a
+        single hop). The full round-trip path is built as outbound + target
+        pubkey prefix + reversed outbound.
+      required: false
+      default: false
+      selector:
+        boolean:
+    route_flags:
+      name: Trace path hash width (flags)
+      description: >-
+        Optional 0 / 1 / 2 = 1-byte / 2-byte / 4-byte path hashes per hop
+        (firmware send_trace flags). For contiguous route hex without commas,
+        set this when using 2-byte or 4-byte hashes. With comma-separated hops,
+        width is usually inferred from each segment; use this to override or
+        validate.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 2
+          mode: box
     timeout:
       name: Timeout
       description: Maximum seconds to wait for the trace response. The effective timeout also respects the firmware's suggested_timeout.

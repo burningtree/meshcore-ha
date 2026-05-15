@@ -95,7 +95,7 @@ Call via `hass.services.async_call(...)` or the WebSocket `call_service` command
 | `meshcore.send_channel_message` | Broadcast on a channel. | none | stable |
 | `meshcore.get_contacts` | Device's known contacts as structured list. | `{contacts: [{adv_name, pubkey_prefix, type, ...}]}` | stable |
 | `meshcore.get_channels` | Configured channels (shared secret omitted; presence reported via `shared_secret_present`). | `{channels: [{channel_idx, channel_name, shared_secret_present}]}` | stable |
-| `meshcore.trace` | Path-trace to a contact (hop list, RTT). Optional `route` (hex) supplies the firmware path and skips path discovery. On failure returns `{trace: null, error: "..."}`. | `{trace: {hops, path, round_trip_ms, ...}}` | stable |
+| `meshcore.trace` | Path-trace (hop list, RTT). Optional `route`: full hex path, comma-separated hop hashes (`0a34,556e`), or with `route_wrap` only the outbound hops; optional `route_flags` (0/1/2) for hash width on contiguous hex. `hops` in the response is from the radio. On failure `{trace: null, error: "..."}`. | `{trace: {hops, path, round_trip_ms, ...}}` | stable |
 | `meshcore.execute_command` | Run a raw SDK command (`command` required; optional `node_id` / `pubkey_prefix` to scope). | text blob (CLI output) | **experimental** — output not versioned. |
 
 **`send_message` recipient.** Provide exactly one of `node_id` (advertised name) or `pubkey_prefix` (≥6 hex chars of the public key).

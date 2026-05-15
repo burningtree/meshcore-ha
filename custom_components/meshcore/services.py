@@ -121,6 +121,119 @@ def _parse_functional_command(command_str: str) -> tuple | None:
         return None
 
 
+def _parse_trace_route(
+    route_text: str,
+    *,
+    wrap_outbound: bool,
+    route_flags_override: Optional[int],
+    public_key_hex: str,
+) -> tuple[Optional[bytes], int, Optional[str]]:
+    """Parse ``meshcore.trace`` route field into ``(path_bytes, flags, error)``.
+
+    * ``flags`` low bits follow firmware / SDK: ``0`` = 1-byte path hashes,
+      ``1`` = 2-byte, ``2`` = 4-byte per hop.
+    * Comma-separated segments (whitespace ignored): each segment is one hop
+      hash in hex, all segments must encode the same byte length (1, 2, or 4
+      bytes). Example: ``0a34,556e`` → two 2-byte hops, ``flags=1``.
+    * No commas: one contiguous hex string; ``flags`` is ``route_flags_override``
+      when set, otherwise ``0``.
+    * ``wrap_outbound``: segments are only the outbound leg; the full trace
+      path is built as outbound + first ``W`` bytes of the contact public key
+      (hex) + outbound reversed (same layout as automatic tracing).
+    """
+    text = route_text.strip()
+    if not text:
+        return None, 0, None
+
+    def _hex_to_chunk(seg: str) -> tuple[Optional[bytes], Optional[str]]:
+        h = "".join(seg.split())
+        if not h:
+            return None, None
+        if len(h) % 2:
+            return None, "invalid_route"
+        try:
+            return bytes.fromhex(h), None
+        except ValueError:
+            return None, "invalid_route"
+
+    if wrap_outbound:
+        if "," in text:
+            parts = [p.strip() for p in text.split(",")]
+        else:
+            parts = [text.strip()]
+        parts = [p for p in parts if p]
+        if not parts:
+            return None, 0, "invalid_route"
+        chunks: list[bytes] = []
+        for p in parts:
+            chunk, err = _hex_to_chunk(p)
+            if err:
+                return None, 0, err
+            assert chunk is not None
+            chunks.append(chunk)
+        widths = {len(c) for c in chunks}
+        if len(widths) != 1:
+            return None, 0, "invalid_route"
+        width = next(iter(widths))
+        if width not in (1, 2, 4):
+            return None, 0, "invalid_route"
+        inferred_flags = {1: 0, 2: 1, 4: 2}[width]
+        if route_flags_override is not None:
+            expected_w = {0: 1, 1: 2, 2: 4}[route_flags_override]
+            if expected_w != width:
+                return None, 0, "invalid_route"
+            flags = route_flags_override
+        else:
+            flags = inferred_flags
+        if len(public_key_hex) < width * 2:
+            return None, 0, "contact_missing_pubkey"
+        try:
+            target = bytes.fromhex(public_key_hex[: width * 2])
+        except ValueError:
+            return None, 0, "contact_missing_pubkey"
+        outbound = b"".join(chunks)
+        return outbound + target + b"".join(reversed(chunks)), flags, None
+
+    if "," in text:
+        parts = [p.strip() for p in text.split(",")]
+        parts = [p for p in parts if p]
+        if not parts:
+            return None, 0, "invalid_route"
+        chunks = []
+        for p in parts:
+            chunk, err = _hex_to_chunk(p)
+            if err:
+                return None, 0, err
+            assert chunk is not None
+            chunks.append(chunk)
+        widths = {len(c) for c in chunks}
+        if len(widths) != 1:
+            return None, 0, "invalid_route"
+        width = next(iter(widths))
+        if width not in (1, 2, 4):
+            return None, 0, "invalid_route"
+        inferred_flags = {1: 0, 2: 1, 4: 2}[width]
+        if route_flags_override is not None:
+            expected_w = {0: 1, 1: 2, 2: 4}[route_flags_override]
+            if expected_w != width:
+                return None, 0, "invalid_route"
+            flags = route_flags_override
+        else:
+            flags = inferred_flags
+        return b"".join(chunks), flags, None
+
+    h = "".join(text.split())
+    try:
+        body = bytes.fromhex(h)
+    except ValueError:
+        return None, 0, "invalid_route"
+    if route_flags_override is not None:
+        flags = route_flags_override
+    else:
+        flags = 0
+    return body, flags, None
+
+
 def _ensure_contact_compat(contact: dict) -> dict:
     """Ensure contact dict has all fields required by the current meshcore SDK.
 
@@ -1328,10 +1441,20 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             handler (Mesh.cpp:41-66) for the sender to receive the echo,
             and 1-byte hashes are empirically the only width that
             completes reliably in production meshes.
-          * Optional ``route`` (hex string, whitespace ignored): use these
-            bytes as the trace path instead of the contact's stored path
-            or a path-discovery pass — same format as ``send_trace`` expects
-            (e.g. from a prior trace or ``out_path`` reconstruction).
+          * Optional ``route``: full ``send_trace`` path as hex, **or**
+            comma-separated hop hashes of equal width (1 / 2 / 4 bytes each),
+            e.g. ``0a34,556e`` for two 2-byte hops (``flags`` inferred, or pass
+            ``route_flags``). Whitespace is ignored; commas only separate hops.
+          * Optional ``route_wrap``: when true, ``route`` lists **outbound**
+            hop hashes only; the integration appends the contact pubkey prefix
+            and the return leg (same layout as automatic tracing). Use this
+            when you know the outbound path but not the full round-trip hex.
+            Response ``hops`` comes from the radio (``path_len`` in TRACE_DATA),
+            not from how many commas you entered — a single-hop path cannot
+            report as multi-hop.
+          * Optional ``route_flags`` (0 / 1 / 2): hash width for **contiguous**
+            hex ``route`` without commas; also validates comma-separated hop
+            width when set.
           * Every failure mode returns a structured ``{"trace": null,
             "error": "..."}`` dict so automations never see an exception.
         """
@@ -1339,11 +1462,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         pubkey_prefix = call.data[ATTR_PUBKEY_PREFIX]
         requested_timeout_s = float(call.data.get("timeout", 15))
         route_raw = call.data.get("route")
-        route_hex = (
-            "".join(str(route_raw).split())
-            if route_raw not in (None, "", False)
-            else ""
-        )
+        route_wrap = bool(call.data.get("route_wrap", False))
+        route_flags_override: Optional[int] = None
+        if call.data.get("route_flags") is not None:
+            route_flags_override = int(call.data["route_flags"])
 
         coordinator = _resolve_coordinator(entry_id)
         if coordinator is None:
@@ -1379,19 +1501,32 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         mesh_core = api.mesh_core
         tag = random.randint(0, 0xFFFFFFFF)
+
+        explicit_route = False
+        trace_path_bytes = b""
         flags = 0
 
-        if route_hex:
-            try:
-                trace_path_bytes = bytes.fromhex(route_hex)
-            except ValueError as ex:
-                _LOGGER.error("trace: invalid route hex: %s", ex)
-                return {"trace": None, "error": "invalid_route"}
-            _LOGGER.debug(
-                "trace: sending tag=%08x flags=%d explicit_route=%s (len=%d bytes)",
-                tag, flags, route_hex, len(trace_path_bytes),
+        rtxt = ""
+        if route_raw not in (None, "", False):
+            rtxt = str(route_raw).strip()
+
+        if rtxt:
+            trace_path_bytes, flags, perr = _parse_trace_route(
+                rtxt,
+                wrap_outbound=route_wrap,
+                route_flags_override=route_flags_override,
+                public_key_hex=public_key,
             )
-        else:
+            if perr:
+                return {"trace": None, "error": perr}
+            explicit_route = True
+            _LOGGER.debug(
+                "trace: explicit route tag=%08x flags=%d len=%d bytes wrap=%s",
+                tag, flags, len(trace_path_bytes), route_wrap,
+            )
+
+        if not explicit_route:
+            flags = 0
             out_path_len = contact.get("out_path_len", -1)
             out_path_hash_mode = contact.get("out_path_hash_mode", 0)
             out_path_hex = contact.get("out_path", "") or ""
@@ -1596,6 +1731,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             vol.Required(ATTR_PUBKEY_PREFIX): cv.string,
             vol.Optional(ATTR_ENTRY_ID): cv.string,
             vol.Optional("route"): cv.string,
+            vol.Optional("route_wrap", default=False): cv.boolean,
+            vol.Optional("route_flags"): vol.All(vol.Coerce(int), vol.In([0, 1, 2])),
             vol.Optional("timeout", default=15): vol.All(
                 vol.Coerce(float), vol.Range(min=1, max=120)
             ),
