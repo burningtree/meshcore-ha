@@ -200,6 +200,7 @@ async def _run_trace_and_await(
     flags: int,
     trace_path_bytes: bytes,
     requested_timeout_s: float,
+    use_firmware_timeout_floor: bool = True,
 ) -> dict:
     """Send ``send_trace`` and wait for TRACE_DATA; return structured response."""
     start_time = time.monotonic()
@@ -227,7 +228,12 @@ async def _run_trace_and_await(
         fw_suggested_s = float(fw_suggested_ms) / 1000.0 * 1.2
     except Exception:
         fw_suggested_s = 18.0
-    effective_timeout = min(max(requested_timeout_s, fw_suggested_s, 5.0), 60.0)
+    if use_firmware_timeout_floor:
+        # meshcore.trace: honour firmware hint so near-limit TRACE_DATA is not cut off
+        effective_timeout = min(max(requested_timeout_s, fw_suggested_s, 5.0), 60.0)
+    else:
+        # meshcore.trace_route: caller controls wait; no 15s+ firmware floor
+        effective_timeout = min(max(requested_timeout_s, 1.0), 120.0)
 
     try:
         trace_event = await mesh_core.dispatcher.wait_for_event(
@@ -1713,7 +1719,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         ``path_len`` from the radio.
         """
         entry_id = call.data.get(ATTR_ENTRY_ID)
-        requested_timeout_s = float(call.data.get("timeout", 15))
+        requested_timeout_s = float(call.data.get("timeout", 5))
         route_raw = call.data.get("route", "")
         route_flags_override: Optional[int] = None
         if call.data.get("route_flags") is not None:
@@ -1749,6 +1755,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             flags=flags,
             trace_path_bytes=trace_path_bytes,
             requested_timeout_s=requested_timeout_s,
+            use_firmware_timeout_floor=False,
         )
 
     hass.services.async_register(
@@ -1773,7 +1780,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             vol.Required("route"): cv.string,
             vol.Optional(ATTR_ENTRY_ID): cv.string,
             vol.Optional("route_flags"): vol.All(vol.Coerce(int), vol.In([0, 1, 2])),
-            vol.Optional("timeout", default=15): vol.All(
+            vol.Optional("timeout", default=5): vol.All(
                 vol.Coerce(float), vol.Range(min=1, max=120)
             ),
         }),

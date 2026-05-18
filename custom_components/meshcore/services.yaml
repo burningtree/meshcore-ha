@@ -293,10 +293,10 @@ trace_route:
           mode: box
     timeout:
       name: Timeout
-      description: Maximum seconds to wait for the trace response. The effective timeout also respects the firmware's suggested_timeout.
+      description: Maximum seconds to wait for the trace response (default 5 seconds).
       required: false
-      default: 15
-      example: 15
+      default: 5
+      example: 5
       selector:
         number:
           min: 1

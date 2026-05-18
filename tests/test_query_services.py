@@ -845,6 +845,26 @@ async def test_trace_route_timeout_returns_structured_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_trace_route_default_timeout_ignores_firmware_floor(monkeypatch):
+    """Default 5s wait is not raised to firmware suggested_timeout * 1.2 (~18s)."""
+    monkeypatch.setattr(_module, "random", MagicMock(randint=lambda lo, hi: 7))
+
+    send_event = _Event(_ET.MSG_SENT, {"tag": 7})
+    coord = _build_coordinator(
+        trace_send_event=send_event,
+        trace_event=None,
+        self_info={"suggested_timeout": 15000},
+    )
+    _, regs = await _setup_and_get_handlers(coord)
+    handler, _ = regs["trace_route"]
+
+    response = await handler(_call({"route": "aa"}))
+    assert response["trace"] is None
+    assert response["error"] == "timeout"
+    assert response["round_trip_ms"] < 8000
+
+
+@pytest.mark.asyncio
 async def test_trace_route_send_error_propagates_reason():
     """send_trace returning an ERROR event → error string from payload.reason."""
     err_event = _Event(_ET.ERROR, {"reason": "invalid_path_format"})
