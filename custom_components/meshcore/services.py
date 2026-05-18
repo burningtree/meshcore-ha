@@ -1482,6 +1482,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if not api or not api.connected or not api.mesh_core:
             return {"trace": None, "error": "not_connected"}
 
+        # Prefer coordinator.get_contact_by_prefix (searches added +
+        # discovered), fall back to the SDK lookup used elsewhere. This
+        # matches the sidebar-panel's behavior so discovered-only contacts
+        # can be recognised and rejected with a clear error.
         contact = None
         get_by_prefix = getattr(coordinator, "get_contact_by_prefix", None)
         if callable(get_by_prefix):
@@ -1491,6 +1495,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if not contact:
             return {"trace": None, "error": "contact_not_found"}
 
+        # Firmware CMD_SEND_PATH_DISCOVERY_REQ memcmps the target pubkey
+        # against the on-device contact table; discovered-only contacts are
+        # rejected with ERR_CODE_NOT_FOUND. Fail fast with an actionable
+        # error instead of paying for the firmware round-trip.
         if not contact.get("added_to_node"):
             return {"trace": None, "error": "contact_not_on_device"}
 
@@ -1505,6 +1513,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         out_path_hash_mode = contact.get("out_path_hash_mode", 0)
         out_path_hex = contact.get("out_path", "") or ""
 
+        # ── Flood contact: run path discovery first ──
         if out_path_len == -1:
             try:
                 dst_bytes = bytes.fromhex(public_key)
@@ -1512,11 +1521,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 _LOGGER.error("trace: bad pubkey hex for path discovery: %s", ex)
                 return {"trace": None, "error": "contact_missing_pubkey"}
 
+            # Pre-register the PATH_RESPONSE listener so the response can't
+            # arrive and be dispatched before our subscription is live.
+            # Filter by pubkey_pre so concurrent path-discovery traffic
+            # for other contacts can't satisfy this wait. Mirrors
+            # Remote-Terminal-for-MeshCore's approach.
             path_response_task = asyncio.create_task(
                 mesh_core.dispatcher.wait_for_event(
                     EventType.PATH_RESPONSE,
                     attribute_filters={"pubkey_pre": pubkey_prefix},
-                    timeout=30.0,
+                    timeout=30.0,  # outer safety; real bound applied below
                 )
             )
 
@@ -1541,6 +1555,9 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
             if getattr(send_result, "type", None) == EventType.ERROR:
                 path_response_task.cancel()
+                # Firmware PacketType.ERROR carries {"error_code",
+                # "code_string"} when mapped, or {"reason"} for reader
+                # parse-failures. Accept either shape.
                 reason = "unknown"
                 if isinstance(send_result.payload, dict):
                     p = send_result.payload
@@ -1557,6 +1574,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     "reason": reason,
                 }
 
+            # MSG_SENT — firmware accepted and broadcast the request.
+            # Apply a 15s floor on the PATH_RESPONSE wait — two-hop flood
+            # round-trips routinely run 5-12s under real LoRa conditions,
+            # and a shorter timeout gives up before the mesh has had time
+            # to answer. Honour firmware's suggested_timeout if it ever
+            # exceeds 15s.
             suggested_ms = 0
             if isinstance(send_result.payload, dict):
                 suggested_ms = send_result.payload.get("suggested_timeout", 0) or 0
@@ -1590,8 +1613,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             out_path_hash_mode = {1: 0, 2: 1, 4: 2}.get(out_path_hash_len, 0)
             out_path_hex = discovered.get("out_path", "") or ""
 
+        # ── Build the round-trip 1-byte-hash path ──
+        # Force flags=0 (1-byte hashes) regardless of the contact's cached
+        # hash mode: 2-byte traces empirically fail to complete round-trip
+        # in production meshes. Truncate each stored hop to its first byte
+        # to match.
         flags = 0
-        target_hash_hex = public_key[:2]
+        target_hash_hex = public_key[:2]  # first 1 byte
         if not target_hash_hex:
             return {"trace": None, "error": "contact_missing_pubkey"}
 
@@ -1618,15 +1646,65 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             tag, flags, full_path_hex, len(outbound_hops), target_hash_hex,
         )
 
-        return await _run_trace_and_await(
-            mesh_core,
-            api,
-            tag=tag,
-            flags=flags,
-            trace_path_bytes=trace_path_bytes,
-            requested_timeout_s=requested_timeout_s,
-        )
+        # ── Send trace and await TRACE_DATA with our tag ──
+        start_time = time.monotonic()
+        try:
+            send_result = await mesh_core.commands.send_trace(
+                0, tag, flags, trace_path_bytes
+            )
+        except Exception as ex:
+            _LOGGER.error("trace: send_trace raised: %s", ex)
+            return {"trace": None, "error": "send_failed"}
 
+        if send_result is None or getattr(send_result, "type", None) == EventType.ERROR:
+            reason = "no_response"
+            if send_result is not None and isinstance(send_result.payload, dict):
+                reason = send_result.payload.get("reason", "unknown")
+            return {"trace": None, "error": reason}
+
+        # Bound the TRACE_DATA wait using (in order of preference) the
+        # user's requested timeout, the device's self-reported suggested
+        # timeout, and sensible floor/ceiling. Use firmware-suggested *1.2
+        # like ws_trace so near-timeout responses aren't cut off.
+        self_info = getattr(api, "self_info", None) or {}
+        fw_suggested_ms = self_info.get("suggested_timeout", 15000) if isinstance(self_info, dict) else 15000
+        try:
+            fw_suggested_s = float(fw_suggested_ms) / 1000.0 * 1.2
+        except Exception:
+            fw_suggested_s = 18.0
+        effective_timeout = min(max(requested_timeout_s, fw_suggested_s, 5.0), 60.0)
+
+        try:
+            trace_event = await mesh_core.dispatcher.wait_for_event(
+                EventType.TRACE_DATA,
+                attribute_filters={"tag": tag},
+                timeout=effective_timeout,
+            )
+        except Exception as ex:
+            _LOGGER.error("trace: awaiting TRACE_DATA raised: %s", ex)
+            return {"trace": None, "error": "await_failed"}
+
+        rtt_ms = int((time.monotonic() - start_time) * 1000)
+        if trace_event is None:
+            return {"trace": None, "error": "timeout", "round_trip_ms": rtt_ms}
+
+        payload = trace_event.payload or {}
+        path_nodes = payload.get("path") or []
+        # Final path entry is the local device on receiving the echo; its
+        # SNR tells callers how strong the return leg was.
+        final_snr = None
+        if path_nodes and isinstance(path_nodes[-1], dict) and "snr" in path_nodes[-1]:
+            final_snr = path_nodes[-1]["snr"]
+
+        return {
+            "trace": {
+                "hops": payload.get("path_len", 0),
+                "path": path_nodes,
+                "round_trip_ms": rtt_ms,
+                "final_snr": final_snr,
+                "tag": payload.get("tag"),
+            }
+        }
     async def async_trace_route_service(call: ServiceCall) -> dict:
         """Trace using an explicit firmware path (no contact lookup).
 

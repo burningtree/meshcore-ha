@@ -11,7 +11,10 @@ tests match that validated behavior:
 
   * get_contacts uses ``coordinator.get_all_contacts()``
   * get_channels reads ``coordinator._channel_info`` directly
-  * trace uses ``pubkey_prefix`` (contact lookup, path discovery).
+  * trace enforces ``added_to_node``, uses a pre-registered
+    PATH_RESPONSE listener + ``commands.send(b"\\x34\\x00"+pubkey)`` for
+    flood contacts, and issues ``send_trace(0, tag, 0, bytes)`` with a
+    round-trip 1-byte-hash path.
   * trace_route requires ``route`` (explicit send_trace path hex).
 """
 import asyncio
