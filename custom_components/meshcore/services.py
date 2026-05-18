@@ -51,6 +51,7 @@ from .const import (
     SERVICE_GET_CONTACTS,
     SERVICE_GET_CHANNELS,
     SERVICE_TRACE,
+    SERVICE_TRACE_ROUTE,
     SELECT_NO_CONTACTS,
     SELECT_NO_DISCOVERED,
     SELECT_NO_ADDED,
@@ -124,26 +125,21 @@ def _parse_functional_command(command_str: str) -> tuple | None:
 def _parse_trace_route(
     route_text: str,
     *,
-    wrap_outbound: bool,
     route_flags_override: Optional[int],
-    public_key_hex: str,
 ) -> tuple[Optional[bytes], int, Optional[str]]:
-    """Parse ``meshcore.trace`` route field into ``(path_bytes, flags, error)``.
+    """Parse ``meshcore.trace_route`` route field into ``(path_bytes, flags, error)``.
 
     * ``flags`` low bits follow firmware / SDK: ``0`` = 1-byte path hashes,
       ``1`` = 2-byte, ``2`` = 4-byte per hop.
     * Comma-separated segments (whitespace ignored): each segment is one hop
       hash in hex, all segments must encode the same byte length (1, 2, or 4
       bytes). Example: ``0a34,556e`` → two 2-byte hops, ``flags=1``.
-    * No commas: one contiguous hex string; ``flags`` is ``route_flags_override``
-      when set, otherwise ``0``.
-    * ``wrap_outbound``: segments are only the outbound leg; the full trace
-      path is built as outbound + first ``W`` bytes of the contact public key
-      (hex) + outbound reversed (same layout as automatic tracing).
+    * No commas: one contiguous hex string (full ``send_trace`` path);
+      ``flags`` is ``route_flags_override`` when set, otherwise ``0``.
     """
     text = route_text.strip()
     if not text:
-        return None, 0, None
+        return None, 0, "route_required"
 
     def _hex_to_chunk(seg: str) -> tuple[Optional[bytes], Optional[str]]:
         h = "".join(seg.split())
@@ -155,44 +151,6 @@ def _parse_trace_route(
             return bytes.fromhex(h), None
         except ValueError:
             return None, "invalid_route"
-
-    if wrap_outbound:
-        if "," in text:
-            parts = [p.strip() for p in text.split(",")]
-        else:
-            parts = [text.strip()]
-        parts = [p for p in parts if p]
-        if not parts:
-            return None, 0, "invalid_route"
-        chunks: list[bytes] = []
-        for p in parts:
-            chunk, err = _hex_to_chunk(p)
-            if err:
-                return None, 0, err
-            assert chunk is not None
-            chunks.append(chunk)
-        widths = {len(c) for c in chunks}
-        if len(widths) != 1:
-            return None, 0, "invalid_route"
-        width = next(iter(widths))
-        if width not in (1, 2, 4):
-            return None, 0, "invalid_route"
-        inferred_flags = {1: 0, 2: 1, 4: 2}[width]
-        if route_flags_override is not None:
-            expected_w = {0: 1, 1: 2, 2: 4}[route_flags_override]
-            if expected_w != width:
-                return None, 0, "invalid_route"
-            flags = route_flags_override
-        else:
-            flags = inferred_flags
-        if len(public_key_hex) < width * 2:
-            return None, 0, "contact_missing_pubkey"
-        try:
-            target = bytes.fromhex(public_key_hex[: width * 2])
-        except ValueError:
-            return None, 0, "contact_missing_pubkey"
-        outbound = b"".join(chunks)
-        return outbound + target + b"".join(reversed(chunks)), flags, None
 
     if "," in text:
         parts = [p.strip() for p in text.split(",")]
@@ -232,6 +190,74 @@ def _parse_trace_route(
     else:
         flags = 0
     return body, flags, None
+
+
+async def _run_trace_and_await(
+    mesh_core: Any,
+    api: Any,
+    *,
+    tag: int,
+    flags: int,
+    trace_path_bytes: bytes,
+    requested_timeout_s: float,
+) -> dict:
+    """Send ``send_trace`` and wait for TRACE_DATA; return structured response."""
+    start_time = time.monotonic()
+    try:
+        send_result = await mesh_core.commands.send_trace(
+            0, tag, flags, trace_path_bytes
+        )
+    except Exception as ex:
+        _LOGGER.error("trace: send_trace raised: %s", ex)
+        return {"trace": None, "error": "send_failed"}
+
+    if send_result is None or getattr(send_result, "type", None) == EventType.ERROR:
+        reason = "no_response"
+        if send_result is not None and isinstance(send_result.payload, dict):
+            reason = send_result.payload.get("reason", "unknown")
+        return {"trace": None, "error": reason}
+
+    self_info = getattr(api, "self_info", None) or {}
+    fw_suggested_ms = (
+        self_info.get("suggested_timeout", 15000)
+        if isinstance(self_info, dict)
+        else 15000
+    )
+    try:
+        fw_suggested_s = float(fw_suggested_ms) / 1000.0 * 1.2
+    except Exception:
+        fw_suggested_s = 18.0
+    effective_timeout = min(max(requested_timeout_s, fw_suggested_s, 5.0), 60.0)
+
+    try:
+        trace_event = await mesh_core.dispatcher.wait_for_event(
+            EventType.TRACE_DATA,
+            attribute_filters={"tag": tag},
+            timeout=effective_timeout,
+        )
+    except Exception as ex:
+        _LOGGER.error("trace: awaiting TRACE_DATA raised: %s", ex)
+        return {"trace": None, "error": "await_failed"}
+
+    rtt_ms = int((time.monotonic() - start_time) * 1000)
+    if trace_event is None:
+        return {"trace": None, "error": "timeout", "round_trip_ms": rtt_ms}
+
+    payload = trace_event.payload or {}
+    path_nodes = payload.get("path") or []
+    final_snr = None
+    if path_nodes and isinstance(path_nodes[-1], dict) and "snr" in path_nodes[-1]:
+        final_snr = path_nodes[-1]["snr"]
+
+    return {
+        "trace": {
+            "hops": payload.get("path_len", 0),
+            "path": path_nodes,
+            "round_trip_ms": rtt_ms,
+            "final_snr": final_snr,
+            "tag": payload.get("tag"),
+        }
+    }
 
 
 def _ensure_contact_compat(contact: dict) -> dict:
@@ -1441,28 +1467,176 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             handler (Mesh.cpp:41-66) for the sender to receive the echo,
             and 1-byte hashes are empirically the only width that
             completes reliably in production meshes.
-          * Optional ``route``: full ``send_trace`` path as hex, **or**
-            comma-separated hop hashes of equal width (1 / 2 / 4 bytes each),
-            e.g. ``0a34,556e`` for two 2-byte hops (``flags`` inferred, or pass
-            ``route_flags``). Whitespace is ignored; commas only separate hops.
-          * Optional ``route_wrap``: when true, ``route`` lists **outbound**
-            hop hashes only; the integration appends the contact pubkey prefix
-            and the return leg (same layout as automatic tracing). Use this
-            when you know the outbound path but not the full round-trip hex.
-            Response ``hops`` comes from the radio (``path_len`` in TRACE_DATA),
-            not from how many commas you entered — a single-hop path cannot
-            report as multi-hop.
-          * Optional ``route_flags`` (0 / 1 / 2): hash width for **contiguous**
-            hex ``route`` without commas; also validates comma-separated hop
-            width when set.
           * Every failure mode returns a structured ``{"trace": null,
             "error": "..."}`` dict so automations never see an exception.
         """
         entry_id = call.data.get(ATTR_ENTRY_ID)
         pubkey_prefix = call.data[ATTR_PUBKEY_PREFIX]
         requested_timeout_s = float(call.data.get("timeout", 15))
-        route_raw = call.data.get("route")
-        route_wrap = bool(call.data.get("route_wrap", False))
+
+        coordinator = _resolve_coordinator(entry_id)
+        if coordinator is None:
+            return {"trace": None, "error": "no_coordinator"}
+
+        api = coordinator.api
+        if not api or not api.connected or not api.mesh_core:
+            return {"trace": None, "error": "not_connected"}
+
+        contact = None
+        get_by_prefix = getattr(coordinator, "get_contact_by_prefix", None)
+        if callable(get_by_prefix):
+            contact = get_by_prefix(pubkey_prefix) or None
+        if not contact:
+            contact = _resolve_contact(pubkey_prefix, "trace", api, coordinator)
+        if not contact:
+            return {"trace": None, "error": "contact_not_found"}
+
+        if not contact.get("added_to_node"):
+            return {"trace": None, "error": "contact_not_on_device"}
+
+        public_key = contact.get("public_key") or ""
+        if not public_key:
+            return {"trace": None, "error": "contact_missing_pubkey"}
+
+        mesh_core = api.mesh_core
+        tag = random.randint(0, 0xFFFFFFFF)
+
+        out_path_len = contact.get("out_path_len", -1)
+        out_path_hash_mode = contact.get("out_path_hash_mode", 0)
+        out_path_hex = contact.get("out_path", "") or ""
+
+        if out_path_len == -1:
+            try:
+                dst_bytes = bytes.fromhex(public_key)
+            except (ValueError, TypeError) as ex:
+                _LOGGER.error("trace: bad pubkey hex for path discovery: %s", ex)
+                return {"trace": None, "error": "contact_missing_pubkey"}
+
+            path_response_task = asyncio.create_task(
+                mesh_core.dispatcher.wait_for_event(
+                    EventType.PATH_RESPONSE,
+                    attribute_filters={"pubkey_pre": pubkey_prefix},
+                    timeout=30.0,
+                )
+            )
+
+            pd_data = b"\x34\x00" + dst_bytes
+            try:
+                send_result = await mesh_core.commands.send(
+                    pd_data,
+                    [EventType.MSG_SENT, EventType.ERROR],
+                )
+            except Exception as ex:
+                path_response_task.cancel()
+                _LOGGER.error("trace: path discovery send raised: %s", ex)
+                return {"trace": None, "error": "path_discovery_failed"}
+
+            if send_result is None:
+                path_response_task.cancel()
+                return {
+                    "trace": None,
+                    "error": "path_discovery_failed",
+                    "reason": "no_firmware_ack",
+                }
+
+            if getattr(send_result, "type", None) == EventType.ERROR:
+                path_response_task.cancel()
+                reason = "unknown"
+                if isinstance(send_result.payload, dict):
+                    p = send_result.payload
+                    reason = (
+                        p.get("code_string")
+                        or p.get("reason")
+                        or (f"error_code={p['error_code']}" if "error_code" in p else "unknown")
+                    )
+                elif send_result.payload is not None:
+                    reason = repr(send_result.payload)
+                return {
+                    "trace": None,
+                    "error": "path_discovery_rejected",
+                    "reason": reason,
+                }
+
+            suggested_ms = 0
+            if isinstance(send_result.payload, dict):
+                suggested_ms = send_result.payload.get("suggested_timeout", 0) or 0
+            pd_timeout = max(suggested_ms / 800.0, 15.0)
+
+            try:
+                path_event = await asyncio.wait_for(
+                    path_response_task, timeout=pd_timeout,
+                )
+            except asyncio.TimeoutError:
+                path_response_task.cancel()
+                path_event = None
+            except Exception as ex:
+                path_response_task.cancel()
+                _LOGGER.error("trace: PATH_RESPONSE wait raised: %s", ex)
+                return {"trace": None, "error": "path_discovery_failed"}
+
+            if path_event is None:
+                return {"trace": None, "error": "path_discovery_timeout"}
+
+            discovered = path_event.payload or {}
+            out_path_len = discovered.get("out_path_len", -1)
+            if out_path_len < 0:
+                return {
+                    "trace": None,
+                    "error": "path_discovery_failed",
+                    "reason": "malformed_path_response",
+                }
+
+            out_path_hash_len = discovered.get("out_path_hash_len", 1)
+            out_path_hash_mode = {1: 0, 2: 1, 4: 2}.get(out_path_hash_len, 0)
+            out_path_hex = discovered.get("out_path", "") or ""
+
+        flags = 0
+        target_hash_hex = public_key[:2]
+        if not target_hash_hex:
+            return {"trace": None, "error": "contact_missing_pubkey"}
+
+        stored_hop_width = {0: 2, 1: 4, 2: 8}.get(out_path_hash_mode, 2)
+        outbound_hops = []
+        for i in range(out_path_len):
+            start = i * stored_hop_width
+            stored_hop = out_path_hex[start : start + stored_hop_width]
+            if len(stored_hop) >= 2:
+                outbound_hops.append(stored_hop[:2])
+        return_hops = list(reversed(outbound_hops))
+        full_path_hex = (
+            "".join(outbound_hops) + target_hash_hex + "".join(return_hops)
+        )
+
+        try:
+            trace_path_bytes = bytes.fromhex(full_path_hex)
+        except ValueError as ex:
+            _LOGGER.error("trace: bad hex in path construction: %s", ex)
+            return {"trace": None, "error": "internal_error"}
+
+        _LOGGER.debug(
+            "trace: sending tag=%08x flags=%d path=%s (hops=%d, target=%s)",
+            tag, flags, full_path_hex, len(outbound_hops), target_hash_hex,
+        )
+
+        return await _run_trace_and_await(
+            mesh_core,
+            api,
+            tag=tag,
+            flags=flags,
+            trace_path_bytes=trace_path_bytes,
+            requested_timeout_s=requested_timeout_s,
+        )
+
+    async def async_trace_route_service(call: ServiceCall) -> dict:
+        """Trace using an explicit firmware path (no contact lookup).
+
+        The caller supplies the full ``send_trace`` path in ``route`` as
+        contiguous hex or comma-separated hop hashes. Response ``hops`` is
+        ``path_len`` from the radio.
+        """
+        entry_id = call.data.get(ATTR_ENTRY_ID)
+        requested_timeout_s = float(call.data.get("timeout", 15))
+        route_raw = call.data.get("route", "")
         route_flags_override: Optional[int] = None
         if call.data.get("route_flags") is not None:
             route_flags_override = int(call.data["route_flags"])
@@ -1475,253 +1649,29 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if not api or not api.connected or not api.mesh_core:
             return {"trace": None, "error": "not_connected"}
 
-        # Prefer coordinator.get_contact_by_prefix (searches added +
-        # discovered), fall back to the SDK lookup used elsewhere. This
-        # matches the sidebar-panel's behavior so discovered-only contacts
-        # can be recognised and rejected with a clear error.
-        contact = None
-        get_by_prefix = getattr(coordinator, "get_contact_by_prefix", None)
-        if callable(get_by_prefix):
-            contact = get_by_prefix(pubkey_prefix) or None
-        if not contact:
-            contact = _resolve_contact(pubkey_prefix, "trace", api, coordinator)
-        if not contact:
-            return {"trace": None, "error": "contact_not_found"}
-
-        # Firmware CMD_SEND_PATH_DISCOVERY_REQ memcmps the target pubkey
-        # against the on-device contact table; discovered-only contacts are
-        # rejected with ERR_CODE_NOT_FOUND. Fail fast with an actionable
-        # error instead of paying for the firmware round-trip.
-        if not contact.get("added_to_node"):
-            return {"trace": None, "error": "contact_not_on_device"}
-
-        public_key = contact.get("public_key") or ""
-        if not public_key:
-            return {"trace": None, "error": "contact_missing_pubkey"}
-
         mesh_core = api.mesh_core
         tag = random.randint(0, 0xFFFFFFFF)
 
-        explicit_route = False
-        trace_path_bytes = b""
-        flags = 0
+        trace_path_bytes, flags, perr = _parse_trace_route(
+            str(route_raw),
+            route_flags_override=route_flags_override,
+        )
+        if perr:
+            return {"trace": None, "error": perr}
 
-        rtxt = ""
-        if route_raw not in (None, "", False):
-            rtxt = str(route_raw).strip()
+        _LOGGER.debug(
+            "trace_route: tag=%08x flags=%d len=%d bytes",
+            tag, flags, len(trace_path_bytes),
+        )
 
-        if rtxt:
-            trace_path_bytes, flags, perr = _parse_trace_route(
-                rtxt,
-                wrap_outbound=route_wrap,
-                route_flags_override=route_flags_override,
-                public_key_hex=public_key,
-            )
-            if perr:
-                return {"trace": None, "error": perr}
-            explicit_route = True
-            _LOGGER.debug(
-                "trace: explicit route tag=%08x flags=%d len=%d bytes wrap=%s",
-                tag, flags, len(trace_path_bytes), route_wrap,
-            )
-
-        if not explicit_route:
-            flags = 0
-            out_path_len = contact.get("out_path_len", -1)
-            out_path_hash_mode = contact.get("out_path_hash_mode", 0)
-            out_path_hex = contact.get("out_path", "") or ""
-
-            # ── Flood contact: run path discovery first ──
-            if out_path_len == -1:
-                try:
-                    dst_bytes = bytes.fromhex(public_key)
-                except (ValueError, TypeError) as ex:
-                    _LOGGER.error("trace: bad pubkey hex for path discovery: %s", ex)
-                    return {"trace": None, "error": "contact_missing_pubkey"}
-
-                # Pre-register the PATH_RESPONSE listener so the response can't
-                # arrive and be dispatched before our subscription is live.
-                # Filter by pubkey_pre so concurrent path-discovery traffic
-                # for other contacts can't satisfy this wait. Mirrors
-                # Remote-Terminal-for-MeshCore's approach.
-                path_response_task = asyncio.create_task(
-                    mesh_core.dispatcher.wait_for_event(
-                        EventType.PATH_RESPONSE,
-                        attribute_filters={"pubkey_pre": pubkey_prefix},
-                        timeout=30.0,  # outer safety; real bound applied below
-                    )
-                )
-
-                pd_data = b"\x34\x00" + dst_bytes
-                try:
-                    send_result = await mesh_core.commands.send(
-                        pd_data,
-                        [EventType.MSG_SENT, EventType.ERROR],
-                    )
-                except Exception as ex:
-                    path_response_task.cancel()
-                    _LOGGER.error("trace: path discovery send raised: %s", ex)
-                    return {"trace": None, "error": "path_discovery_failed"}
-
-                if send_result is None:
-                    path_response_task.cancel()
-                    return {
-                        "trace": None,
-                        "error": "path_discovery_failed",
-                        "reason": "no_firmware_ack",
-                    }
-
-                if getattr(send_result, "type", None) == EventType.ERROR:
-                    path_response_task.cancel()
-                    # Firmware PacketType.ERROR carries {"error_code",
-                    # "code_string"} when mapped, or {"reason"} for reader
-                    # parse-failures. Accept either shape.
-                    reason = "unknown"
-                    if isinstance(send_result.payload, dict):
-                        p = send_result.payload
-                        reason = (
-                            p.get("code_string")
-                            or p.get("reason")
-                            or (f"error_code={p['error_code']}" if "error_code" in p else "unknown")
-                        )
-                    elif send_result.payload is not None:
-                        reason = repr(send_result.payload)
-                    return {
-                        "trace": None,
-                        "error": "path_discovery_rejected",
-                        "reason": reason,
-                    }
-
-                # MSG_SENT — firmware accepted and broadcast the request.
-                # Apply a 15s floor on the PATH_RESPONSE wait — two-hop flood
-                # round-trips routinely run 5-12s under real LoRa conditions,
-                # and a shorter timeout gives up before the mesh has had time
-                # to answer. Honour firmware's suggested_timeout if it ever
-                # exceeds 15s.
-                suggested_ms = 0
-                if isinstance(send_result.payload, dict):
-                    suggested_ms = send_result.payload.get("suggested_timeout", 0) or 0
-                pd_timeout = max(suggested_ms / 800.0, 15.0)
-
-                try:
-                    path_event = await asyncio.wait_for(
-                        path_response_task, timeout=pd_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    path_response_task.cancel()
-                    path_event = None
-                except Exception as ex:
-                    path_response_task.cancel()
-                    _LOGGER.error("trace: PATH_RESPONSE wait raised: %s", ex)
-                    return {"trace": None, "error": "path_discovery_failed"}
-
-                if path_event is None:
-                    return {"trace": None, "error": "path_discovery_timeout"}
-
-                discovered = path_event.payload or {}
-                out_path_len = discovered.get("out_path_len", -1)
-                if out_path_len < 0:
-                    return {
-                        "trace": None,
-                        "error": "path_discovery_failed",
-                        "reason": "malformed_path_response",
-                    }
-
-                out_path_hash_len = discovered.get("out_path_hash_len", 1)
-                out_path_hash_mode = {1: 0, 2: 1, 4: 2}.get(out_path_hash_len, 0)
-                out_path_hex = discovered.get("out_path", "") or ""
-
-            # ── Build the round-trip 1-byte-hash path ──
-            # Force flags=0 (1-byte hashes) regardless of the contact's cached
-            # hash mode: 2-byte traces empirically fail to complete round-trip
-            # in production meshes. Truncate each stored hop to its first byte
-            # to match.
-            target_hash_hex = public_key[:2]  # first 1 byte
-            if not target_hash_hex:
-                return {"trace": None, "error": "contact_missing_pubkey"}
-
-            stored_hop_width = {0: 2, 1: 4, 2: 8}.get(out_path_hash_mode, 2)
-            outbound_hops = []
-            for i in range(out_path_len):
-                start = i * stored_hop_width
-                stored_hop = out_path_hex[start : start + stored_hop_width]
-                if len(stored_hop) >= 2:
-                    outbound_hops.append(stored_hop[:2])
-            return_hops = list(reversed(outbound_hops))
-            full_path_hex = (
-                "".join(outbound_hops) + target_hash_hex + "".join(return_hops)
-            )
-
-            try:
-                trace_path_bytes = bytes.fromhex(full_path_hex)
-            except ValueError as ex:
-                _LOGGER.error("trace: bad hex in path construction: %s", ex)
-                return {"trace": None, "error": "internal_error"}
-
-            _LOGGER.debug(
-                "trace: sending tag=%08x flags=%d path=%s (hops=%d, target=%s)",
-                tag, flags, full_path_hex, len(outbound_hops), target_hash_hex,
-            )
-
-        # ── Send trace and await TRACE_DATA with our tag ──
-        start_time = time.monotonic()
-        try:
-            send_result = await mesh_core.commands.send_trace(
-                0, tag, flags, trace_path_bytes
-            )
-        except Exception as ex:
-            _LOGGER.error("trace: send_trace raised: %s", ex)
-            return {"trace": None, "error": "send_failed"}
-
-        if send_result is None or getattr(send_result, "type", None) == EventType.ERROR:
-            reason = "no_response"
-            if send_result is not None and isinstance(send_result.payload, dict):
-                reason = send_result.payload.get("reason", "unknown")
-            return {"trace": None, "error": reason}
-
-        # Bound the TRACE_DATA wait using (in order of preference) the
-        # user's requested timeout, the device's self-reported suggested
-        # timeout, and sensible floor/ceiling. Use firmware-suggested *1.2
-        # like ws_trace so near-timeout responses aren't cut off.
-        self_info = getattr(api, "self_info", None) or {}
-        fw_suggested_ms = self_info.get("suggested_timeout", 15000) if isinstance(self_info, dict) else 15000
-        try:
-            fw_suggested_s = float(fw_suggested_ms) / 1000.0 * 1.2
-        except Exception:
-            fw_suggested_s = 18.0
-        effective_timeout = min(max(requested_timeout_s, fw_suggested_s, 5.0), 60.0)
-
-        try:
-            trace_event = await mesh_core.dispatcher.wait_for_event(
-                EventType.TRACE_DATA,
-                attribute_filters={"tag": tag},
-                timeout=effective_timeout,
-            )
-        except Exception as ex:
-            _LOGGER.error("trace: awaiting TRACE_DATA raised: %s", ex)
-            return {"trace": None, "error": "await_failed"}
-
-        rtt_ms = int((time.monotonic() - start_time) * 1000)
-        if trace_event is None:
-            return {"trace": None, "error": "timeout", "round_trip_ms": rtt_ms}
-
-        payload = trace_event.payload or {}
-        path_nodes = payload.get("path") or []
-        # Final path entry is the local device on receiving the echo; its
-        # SNR tells callers how strong the return leg was.
-        final_snr = None
-        if path_nodes and isinstance(path_nodes[-1], dict) and "snr" in path_nodes[-1]:
-            final_snr = path_nodes[-1]["snr"]
-
-        return {
-            "trace": {
-                "hops": payload.get("path_len", 0),
-                "path": path_nodes,
-                "round_trip_ms": rtt_ms,
-                "final_snr": final_snr,
-                "tag": payload.get("tag"),
-            }
-        }
+        return await _run_trace_and_await(
+            mesh_core,
+            api,
+            tag=tag,
+            flags=flags,
+            trace_path_bytes=trace_path_bytes,
+            requested_timeout_s=requested_timeout_s,
+        )
 
     hass.services.async_register(
         DOMAIN,
@@ -1730,8 +1680,20 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         schema=vol.Schema({
             vol.Required(ATTR_PUBKEY_PREFIX): cv.string,
             vol.Optional(ATTR_ENTRY_ID): cv.string,
-            vol.Optional("route"): cv.string,
-            vol.Optional("route_wrap", default=False): cv.boolean,
+            vol.Optional("timeout", default=15): vol.All(
+                vol.Coerce(float), vol.Range(min=1, max=120)
+            ),
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_TRACE_ROUTE,
+        async_trace_route_service,
+        schema=vol.Schema({
+            vol.Required("route"): cv.string,
+            vol.Optional(ATTR_ENTRY_ID): cv.string,
             vol.Optional("route_flags"): vol.All(vol.Coerce(int), vol.In([0, 1, 2])),
             vol.Optional("timeout", default=15): vol.All(
                 vol.Coerce(float), vol.Range(min=1, max=120)
@@ -1829,6 +1791,9 @@ async def async_unload_services(hass: HomeAssistant) -> None:
 
     if hass.services.has_service(DOMAIN, SERVICE_TRACE):
         hass.services.async_remove(DOMAIN, SERVICE_TRACE)
+
+    if hass.services.has_service(DOMAIN, SERVICE_TRACE_ROUTE):
+        hass.services.async_remove(DOMAIN, SERVICE_TRACE_ROUTE)
 
 
 def create_service_call(

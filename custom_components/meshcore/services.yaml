@@ -228,9 +228,8 @@ trace:
     Trace the route to a contact and return hop count, per-hop path, and
     round-trip time. The contact must be saved to the device — discovered-only
     contacts return {"trace": null, "error": "contact_not_on_device"}. For
-    flood contacts a path-discovery pass runs first unless you pass an
-    explicit route hex string; the firmware path is then used to build the
-    trace. On timeout or any failure, returns {"trace": null,
+    flood contacts a path-discovery pass runs first; the result is used to
+    build the trace. On timeout or any failure, returns {"trace": null,
     "error": "..."} so automations always get a structured response.
   response: optional
   fields:
@@ -241,38 +240,51 @@ trace:
       example: "f293ac"
       selector:
         text:
+    timeout:
+      name: Timeout
+      description: Maximum seconds to wait for the trace response. The effective timeout also respects the firmware's suggested_timeout.
+      required: false
+      default: 15
+      example: 15
+      selector:
+        number:
+          min: 1
+          max: 120
+          unit_of_measurement: seconds
+    entry_id:
+      name: Config Entry ID
+      description: The config entry ID if you have multiple MeshCore devices. Leave empty to use the first available device.
+      required: false
+      example: "abc123def456"
+      selector:
+        text:
+
+trace_route:
+  name: Trace Route
+  description: >-
+    Trace using an explicit firmware path (no contact lookup). Supply the full
+    send_trace path in route. On timeout or failure returns {"trace": null,
+    "error": "..."}.
+  response: optional
+  fields:
     route:
       name: Trace route (hex)
       description: >-
-        Optional. Either one contiguous hex string (full send_trace path), or
-        comma-separated hop hashes of equal width — e.g. 0a34,556e is two 2-byte
-        hops (whitespace ignored). Enable "Wrap outbound only" to pass only the
-        forward hop list; the integration then appends the contact pubkey
-        fragment and the return leg like automatic tracing. Response hops come
-        from the radio, not from how many segments you type; a one-byte path
-        cannot produce a multi-hop trace.
-      required: false
-      example: "0a34,556e"
+        Full firmware trace path: one contiguous hex string, or comma-separated
+        hop hashes of equal width (e.g. 0a34,556e for two 2-byte hops).
+        Whitespace is ignored. Build the round-trip path (outbound + target +
+        return) before calling.
+      required: true
+      example: "aabbabbbaa"
       selector:
         text:
-    route_wrap:
-      name: Wrap outbound only
-      description: >-
-        When enabled, route lists only outbound hop hashes (comma-separated or a
-        single hop). The full round-trip path is built as outbound + target
-        pubkey prefix + reversed outbound.
-      required: false
-      default: false
-      selector:
-        boolean:
     route_flags:
       name: Trace path hash width (flags)
       description: >-
         Optional 0 / 1 / 2 = 1-byte / 2-byte / 4-byte path hashes per hop
         (firmware send_trace flags). For contiguous route hex without commas,
         set this when using 2-byte or 4-byte hashes. With comma-separated hops,
-        width is usually inferred from each segment; use this to override or
-        validate.
+        width is usually inferred from each segment.
       required: false
       selector:
         number:

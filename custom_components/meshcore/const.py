@@ -40,6 +40,7 @@ SERVICE_CLEAR_DISCOVERED_CONTACTS: Final = "clear_discovered_contacts"
 SERVICE_GET_CONTACTS: Final = "get_contacts"
 SERVICE_GET_CHANNELS: Final = "get_channels"
 SERVICE_TRACE: Final = "trace"
+SERVICE_TRACE_ROUTE: Final = "trace_route"
 
 # Select entity placeholders
 SELECT_NO_CONTACTS: Final = "Select a contact..."

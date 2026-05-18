@@ -95,7 +95,8 @@ Call via `hass.services.async_call(...)` or the WebSocket `call_service` command
 | `meshcore.send_channel_message` | Broadcast on a channel. | none | stable |
 | `meshcore.get_contacts` | Device's known contacts as structured list. | `{contacts: [{adv_name, pubkey_prefix, type, ...}]}` | stable |
 | `meshcore.get_channels` | Configured channels (shared secret omitted; presence reported via `shared_secret_present`). | `{channels: [{channel_idx, channel_name, shared_secret_present}]}` | stable |
-| `meshcore.trace` | Path-trace (hop list, RTT). Optional `route`: full hex path, comma-separated hop hashes (`0a34,556e`), or with `route_wrap` only the outbound hops; optional `route_flags` (0/1/2) for hash width on contiguous hex. `hops` in the response is from the radio. On failure `{trace: null, error: "..."}`. | `{trace: {hops, path, round_trip_ms, ...}}` | stable |
+| `meshcore.trace` | Path-trace to a saved contact by `pubkey_prefix` (hop list, RTT). Builds path from contact / path discovery. On failure `{trace: null, error: "..."}`. | `{trace: {hops, path, round_trip_ms, ...}}` | stable |
+| `meshcore.trace_route` | Path-trace with explicit `route` hex (no contact lookup). Comma-separated hop hashes or contiguous hex; optional `route_flags` (0/1/2). | `{trace: {hops, path, round_trip_ms, ...}}` | stable |
 | `meshcore.execute_command` | Run a raw SDK command (`command` required; optional `node_id` / `pubkey_prefix` to scope). | text blob (CLI output) | **experimental** — output not versioned. |
 
 **`send_message` recipient.** Provide exactly one of `node_id` (advertised name) or `pubkey_prefix` (≥6 hex chars of the public key).
@@ -149,10 +150,12 @@ Failure shape: `{"channels": [], "error": "no_coordinator"}`.
 {"trace": None, "error": "<code>", ...}
 ```
 
-Documented error codes: `no_coordinator`, `not_connected`, `contact_not_found`, `contact_not_on_device`, `contact_missing_pubkey`, `invalid_route`, `path_discovery_failed`, `path_discovery_rejected`, `path_discovery_timeout`, `timeout`, `send_failed`, `await_failed`, `internal_error`. Firmware-supplied error strings may also appear as the `error` value when the radio rejects the trace request — companions should treat any non-listed string as opaque diagnostic text.
+**`trace`** documented error codes: `no_coordinator`, `not_connected`, `contact_not_found`, `contact_not_on_device`, `contact_missing_pubkey`, `path_discovery_failed`, `path_discovery_rejected`, `path_discovery_timeout`, `timeout`, `send_failed`, `await_failed`, `internal_error`.
+
+**`trace_route`** documented error codes: `no_coordinator`, `not_connected`, `route_required`, `invalid_route`, `timeout`, `send_failed`, `await_failed`. Firmware-supplied error strings may also appear as the `error` value when the radio rejects the trace request — companions should treat any non-listed string as opaque diagnostic text.
 
 Failure responses may carry additional fields:
-- `reason`: human-readable detail accompanying `path_discovery_failed` and `path_discovery_rejected`.
+- `reason`: human-readable detail accompanying `path_discovery_failed` and `path_discovery_rejected` (`trace` only).
 - `round_trip_ms`: present on `timeout` so companions can show how long the wait actually was.
 
 ## Entities
