@@ -1628,7 +1628,12 @@ class MeshCoreRepeaterSensor(CoordinatorEntity, SensorEntity):
                     if uptime_delta > 0 and metric_delta >= 0:
                         utilization_rate = (metric_delta / uptime_delta) * 100
                         return round(utilization_rate, 1)
-            return 0  # No previous data or no change
+
+            # No previous stats yet (first reading after restart) — fall back to
+            # lifetime average so the sensor is never stuck at 0% unnecessarily.
+            if current_uptime > 0 and current_metric >= 0:
+                return round((current_metric / current_uptime) * 100, 1)
+            return 0
 
         # Handle rate calculations for message counters
         elif key.endswith(RATE_SUFFIX):
