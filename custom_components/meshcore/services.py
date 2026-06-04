@@ -1784,7 +1784,9 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 vol.Coerce(float), vol.Range(min=1, max=120)
             ),
         }),
-        supports_response=SupportsResponse.ONLY,
+        # OPTIONAL: scripts may omit response_variable; add it when you need
+        # the returned trace dict (e.g. response_variable: trace_result).
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
     # Create CLI command execution service from UI helper
